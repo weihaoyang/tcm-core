@@ -1,0 +1,575 @@
+import { Solar } from "lunar-typescript";
+import type { BaziPillarDetail, NormalizedBaziChart } from "./types";
+import { analyzeBaziRelations, type BaziRelation } from "./relations-analysis";
+import { getChinaEphemerisParts, getTimeZoneParts, toZonedDate } from "@/lib/qimen/timezone";
+
+export type BaziSerializationOptions = {
+  /**
+   * A Date whose local calendar fields specify the reference civil date.
+   * Its time of day is not used to choose a side of a transition.
+   *
+   * Leaving it unset falls back to the wall clock, which makes the payload vary
+   * with time — correct for the browser workbench (the user's clock *is* the
+   * answer to "what year is it now"), but a trap on the server: the same chart
+   * then serializes differently on every call, and the value is read back with
+   * the *server's* local accessors. Server-side callers should resolve the
+   * caller's civil date explicitly and pass it in.
+   */
+  referenceDate?: Date;
+  /** Zone of the reference civil date; defaults to the profile's time zone. */
+  referenceTimeZone?: string;
+};
+
+export type BaziRelationMatch = {
+  branches?: string;
+  stems?: string;
+  symbols?: string;
+  positions: string[];
+  pattern: string;
+  detail?: string;
+};
+
+export type BaziRelationSummary = {
+  heavenlyStemCombinations: BaziRelationMatch[];
+  heavenlyStemClashes: BaziRelationMatch[];
+  heavenlyStemControls: BaziRelationMatch[];
+  earthlyBranchRelations: {
+    liuHe: BaziRelationMatch[];
+    liuChong: BaziRelationMatch[];
+    banHe: BaziRelationMatch[];
+    gongHe: BaziRelationMatch[];
+    sanHe: BaziRelationMatch[];
+    sanHui: BaziRelationMatch[];
+    xing: BaziRelationMatch[];
+    hai: BaziRelationMatch[];
+    po: BaziRelationMatch[];
+  };
+  tianKeDiChong: BaziRelationMatch[];
+  fuYin: BaziRelationMatch[];
+  dayXunKongVoid: BaziRelationMatch[];
+  missingElements: string[];
+  dayMasterStrength: string;
+  notes: string[];
+  timing: {
+    referenceDate: string;
+    liuNian: {
+      calendarYear: number;
+      ganZhi: string | null;
+      xun: string | null;
+      xunKong: string | null;
+      candidates: Array<{ ganZhi: string; xun: string; xunKong: string }>;
+    };
+    currentDaYun: NormalizedBaziChart["raw"]["yun"]["daYun"][number] | null;
+    note: string;
+  };
+};
+
+const PILLAR_LABELS: Record<BaziPillarDetail["key"], string> = {
+  year: "年柱",
+  month: "月柱",
+  day: "日柱",
+  time: "时柱",
+};
+
+const HEAVENLY_STEM_COMBINATIONS = [
+  ["甲", "己"],
+  ["乙", "庚"],
+  ["丙", "辛"],
+  ["丁", "壬"],
+  ["戊", "癸"],
+] as const;
+
+const BRANCH_PAIR_RELATIONS = {
+  liuHe: [
+    ["子", "丑"],
+    ["寅", "亥"],
+    ["卯", "戌"],
+    ["辰", "酉"],
+    ["巳", "申"],
+    ["午", "未"],
+  ],
+  liuChong: [
+    ["子", "午"],
+    ["丑", "未"],
+    ["寅", "申"],
+    ["卯", "酉"],
+    ["辰", "戌"],
+    ["巳", "亥"],
+  ],
+  hai: [
+    ["子", "未"],
+    ["丑", "午"],
+    ["寅", "巳"],
+    ["卯", "辰"],
+    ["申", "亥"],
+    ["酉", "戌"],
+  ],
+} as const;
+
+const XING_PAIRS = [
+  ["寅", "巳"],
+  ["寅", "申"],
+  ["巳", "申"],
+  ["丑", "未"],
+  ["丑", "戌"],
+  ["未", "戌"],
+  ["子", "卯"],
+] as const;
+
+const SELF_XING_BRANCHES = ["辰", "午", "酉", "亥"] as const;
+
+const SAN_HE_GROUPS = [
+  { name: "三合水局", branches: ["申", "子", "辰"] },
+  { name: "三合木局", branches: ["亥", "卯", "未"] },
+  { name: "三合火局", branches: ["寅", "午", "戌"] },
+  { name: "三合金局", branches: ["巳", "酉", "丑"] },
+] as const;
+
+const SAN_HUI_GROUPS = [
+  { name: "三会木局", branches: ["寅", "卯", "辰"] },
+  { name: "三会火局", branches: ["巳", "午", "未"] },
+  { name: "三会金局", branches: ["申", "酉", "戌"] },
+  { name: "三会水局", branches: ["亥", "子", "丑"] },
+] as const;
+
+const isMatchingPair = (
+  left: string,
+  right: string,
+  pairs: readonly (readonly [string, string])[],
+) =>
+  pairs.some(
+    ([first, second]) =>
+      (left === first && right === second) || (left === second && right === first),
+  );
+
+const buildPairMatches = (
+  tokens: Array<{ value: string; position: string }>,
+  pairs: readonly (readonly [string, string])[],
+  pattern: string,
+): BaziRelationMatch[] => {
+  const matches: BaziRelationMatch[] = [];
+
+  for (let leftIndex = 0; leftIndex < tokens.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < tokens.length; rightIndex += 1) {
+      const left = tokens[leftIndex];
+      const right = tokens[rightIndex];
+
+      if (!left || !right || !isMatchingPair(left.value, right.value, pairs)) {
+        continue;
+      }
+
+      matches.push({
+        branches: `${left.value}${right.value}`,
+        positions: [left.position, right.position],
+        pattern,
+      });
+    }
+  }
+
+  return matches;
+};
+
+const buildGroupMatches = (
+  tokens: Array<{ value: string; position: string }>,
+  groups: readonly { name: string; branches: readonly string[] }[],
+): BaziRelationMatch[] => {
+  const matches: BaziRelationMatch[] = [];
+
+  for (const group of groups) {
+    for (let firstIndex = 0; firstIndex < tokens.length; firstIndex += 1) {
+      for (let secondIndex = firstIndex + 1; secondIndex < tokens.length; secondIndex += 1) {
+        for (
+          let thirdIndex = secondIndex + 1;
+          thirdIndex < tokens.length;
+          thirdIndex += 1
+        ) {
+          const selected = [
+            tokens[firstIndex],
+            tokens[secondIndex],
+            tokens[thirdIndex],
+          ];
+
+          if (
+            selected.some((token) => !token) ||
+            new Set(selected.map((token) => token?.value)).size !== 3 ||
+            !group.branches.every((branch) => selected.some((token) => token?.value === branch))
+          ) {
+            continue;
+          }
+
+          matches.push({
+            branches: group.branches.join(""),
+            positions: selected.map((token) => token!.position),
+            pattern: group.name,
+          });
+        }
+      }
+    }
+  }
+
+  return matches;
+};
+
+const buildStemCombinationMatches = (
+  pillars: NormalizedBaziChart["raw"]["pillars"],
+): BaziRelationMatch[] => {
+  const tokens = pillars.map((pillar) => ({
+    value: pillar.heavenlyStem,
+    position: PILLAR_LABELS[pillar.key],
+  }));
+
+  return buildPairMatches(tokens, HEAVENLY_STEM_COMBINATIONS, "天干五合").map((match) => ({
+    stems:
+      HEAVENLY_STEM_COMBINATIONS.find(
+        ([first, second]) =>
+          match.branches === `${first}${second}` || match.branches === `${second}${first}`,
+      )?.join("") ?? match.branches,
+    positions: match.positions,
+    pattern: match.pattern,
+  }));
+};
+
+const buildXingMatches = (
+  pillars: NormalizedBaziChart["raw"]["pillars"],
+): BaziRelationMatch[] => {
+  const tokens = pillars.map((pillar) => ({
+    value: pillar.earthlyBranch,
+    position: PILLAR_LABELS[pillar.key],
+  }));
+  const pairMatches = buildPairMatches(tokens, XING_PAIRS, "相刑");
+  const selfMatches = buildPairMatches(tokens, SELF_XING_BRANCHES.map((branch) => [branch, branch] as const), "自刑");
+
+  return [
+    ...pairMatches,
+    ...selfMatches,
+    ...buildGroupMatches(tokens, [
+      { name: "无恩三刑", branches: ["寅", "巳", "申"] },
+      { name: "恃势三刑", branches: ["丑", "未", "戌"] },
+    ]),
+  ];
+};
+
+const formatReferenceDate = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const buildTimingSummary = (
+  chart: NormalizedBaziChart,
+  referenceDate: Date,
+  referenceTimeZone: string,
+): BaziRelationSummary["timing"] => {
+  const calendarYear = referenceDate.getFullYear();
+  const solar = Solar.fromYmd(
+    calendarYear,
+    referenceDate.getMonth() + 1,
+    referenceDate.getDate(),
+  );
+  const lunar = solar.getLunar();
+  const useLunarNewYear = chart.raw.conventions.yearBoundary === "lunar-new-year";
+  // Convert both ends of the selected local date to the ephemeris clock before
+  // evaluating 立春; the local date containing that instant varies by zone.
+  const reference = formatReferenceDate(referenceDate);
+  const lunarAtDayEdge = (first: boolean) => {
+    // Some zones skip midnight for DST. Find the first/last valid wall minute;
+    // do not silently map a completely skipped civil date to a different day.
+    for (let offset = 0; offset < 1440; offset++) {
+      const minute = first ? offset : 1439 - offset;
+      const time = `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:${first ? "00" : "59"}`;
+      try {
+        const china = getChinaEphemerisParts(toZonedDate(`${reference}T${time}`, referenceTimeZone));
+        return Solar.fromYmdHms(china.year, china.month, china.day, china.hour, china.minute, china.second).getLunar();
+      } catch {
+        // Try the next minute on the same civil date.
+      }
+    }
+    throw new Error(`时区 ${referenceTimeZone} 不存在日期 ${reference}`);
+  };
+  const firstLunar = useLunarNewYear ? lunar : lunarAtDayEdge(true);
+  const endOfDayLunar = useLunarNewYear ? lunar : lunarAtDayEdge(false);
+  const yearFields = (value: typeof lunar) => useLunarNewYear
+    ? { ganZhi: value.getYearInGanZhi(), xun: value.getYearXun(), xunKong: value.getYearXunKong() }
+    : { ganZhi: value.getYearInGanZhiExact(), xun: value.getYearXunExact(), xunKong: value.getYearXunKongExact() };
+  const firstYear = yearFields(firstLunar);
+  const lastYear = yearFields(endOfDayLunar);
+  const candidates = firstYear.ganZhi === lastYear.ganZhi ? [firstYear] : [firstYear, lastYear];
+  const selectedYear = candidates.length === 1 ? firstYear : null;
+  // The reference is only used as a civil date here. On the transition date
+  // the time is unknown, so neither adjacent cycle can be selected safely.
+  const startMatch = /^(\d{4})-(\d{2})-(\d{2}) /.exec(chart.raw.yun.startSolar);
+  const start = startMatch ? Solar.fromYmd(Number(startMatch[1]), Number(startMatch[2]), Number(startMatch[3])) : null;
+  const boundaries = start ? Array.from({ length: chart.raw.yun.daYun.length + 1 }, (_, i) => start.nextYear(i * 10).toYmd()) : [];
+  const atBoundary = boundaries.includes(reference);
+  const currentIndex = atBoundary ? -1 : boundaries.findIndex((boundary, i) =>
+    i < chart.raw.yun.daYun.length && reference > boundary && reference < boundaries[i + 1]);
+  const currentDaYun = currentIndex >= 0 ? chart.raw.yun.daYun[currentIndex] : null;
+  const currentNote = !start ? "起运日期缺失，无法定位当前大运。"
+    : atBoundary ? "参考日期为交运日；仅按日期判断无法区分交运前后。"
+      : currentDaYun ? "按起运日期每十周年交运；参考日期未包含交运时刻。"
+        : "参考日期不在已提供的大运区间内。";
+
+  return {
+    referenceDate: reference,
+    liuNian: {
+      calendarYear,
+      ganZhi: selectedYear?.ganZhi ?? null,
+      xun: selectedYear?.xun ?? null,
+      xunKong: selectedYear?.xunKong ?? null,
+      candidates,
+    },
+    currentDaYun,
+    note: `${useLunarNewYear ? "流年按参考日期的农历春节年干支" : `流年按 ${referenceTimeZone} 参考日期对应的立春节气年干支`}${selectedYear ? "提供" : "：该日跨立春，缺少具体时刻，列出前后候选"}；${currentNote}`,
+  };
+};
+
+export const buildBaziRelationSummary = (
+  chart: NormalizedBaziChart,
+  options: BaziSerializationOptions = {},
+): BaziRelationSummary => {
+  const branchTokens = chart.raw.pillars.map((pillar) => ({
+    value: pillar.earthlyBranch,
+    position: PILLAR_LABELS[pillar.key],
+  }));
+  const engine = analyzeBaziRelations(chart);
+  const toMatch = (relation: BaziRelation): BaziRelationMatch => ({
+    ...(relation.kind.startsWith("天干") ? { stems: relation.symbols } : { branches: relation.symbols }),
+    symbols: relation.symbols,
+    positions: relation.pillars.map((key) => PILLAR_LABELS[key]),
+    pattern: relation.kind,
+    detail: relation.detail,
+  });
+  const matchesOf = (kind: BaziRelation["kind"]) =>
+    engine.relations.filter((relation) => relation.kind === kind).map(toMatch);
+  const dayPillar = chart.raw.pillars.find((pillar) => pillar.key === "day");
+  const dayXunKong = dayPillar?.xunKong ?? "";
+
+  return {
+    heavenlyStemCombinations: buildStemCombinationMatches(chart.raw.pillars),
+    heavenlyStemClashes: matchesOf("天干相冲"),
+    heavenlyStemControls: matchesOf("天干相克"),
+    earthlyBranchRelations: {
+      liuHe: buildPairMatches(branchTokens, BRANCH_PAIR_RELATIONS.liuHe, "六合"),
+      liuChong: buildPairMatches(branchTokens, BRANCH_PAIR_RELATIONS.liuChong, "六冲"),
+      banHe: matchesOf("地支半合"),
+      gongHe: matchesOf("地支拱合"),
+      sanHe: buildGroupMatches(branchTokens, SAN_HE_GROUPS),
+      sanHui: buildGroupMatches(branchTokens, SAN_HUI_GROUPS),
+      xing: buildXingMatches(chart.raw.pillars),
+      hai: buildPairMatches(branchTokens, BRANCH_PAIR_RELATIONS.hai, "六害"),
+      po: matchesOf("地支六破"),
+    },
+    tianKeDiChong: matchesOf("天克地冲"),
+    fuYin: matchesOf("伏吟"),
+    dayXunKongVoid: dayXunKong
+      ? chart.raw.pillars
+          .filter((pillar) => pillar.key !== "day" && dayXunKong.includes(pillar.earthlyBranch))
+          .map((pillar) => ({
+            branches: pillar.earthlyBranch,
+            symbols: pillar.earthlyBranch,
+            positions: [PILLAR_LABELS[pillar.key]],
+            pattern: "空亡",
+          }))
+      : [],
+    missingElements: engine.missingElements,
+    dayMasterStrength: chart.raw.structureAudit.dayMasterStrength,
+    notes: engine.notes,
+    timing: buildTimingSummary(chart, options.referenceDate ?? (() => {
+      const now = getTimeZoneParts(new Date(), options.referenceTimeZone ?? chart.input.normalized.timeZone);
+      return new Date(now.year, now.month - 1, now.day, 12);
+    })(), options.referenceTimeZone ?? chart.input.normalized.timeZone),
+  };
+};
+
+const formatRelationMatches = (matches: BaziRelationMatch[], withDetail = false) =>
+  matches.length > 0
+    ? matches
+        .map((match) => {
+          const value = match.branches ?? match.stems ?? "未知";
+          return `${value}（${match.positions.join("、")}）${withDetail && match.detail ? `：${match.detail}` : ""}`;
+        })
+        .join("；")
+    : "无";
+
+const normalizeValue = (value: unknown): unknown => {
+  if (value === undefined || value === null || value === "") {
+    return "无";
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(normalizeValue);
+  }
+
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, nextValue]) => [
+        key,
+        normalizeValue(nextValue),
+      ]),
+    );
+  }
+
+  return value;
+};
+
+export const serializeBaziToCompactJson = (
+  chart: NormalizedBaziChart,
+  options: BaziSerializationOptions = {},
+) => {
+  const relations = buildBaziRelationSummary(chart, options);
+
+  return JSON.stringify({
+    format: "bazi-llm-compact-v1",
+    note: "仅提供传统排盘分析材料，不包含程序化结论或自动断语。关系摘要只记录盘面中出现的干支组合，不等于传统推断或事件断语。legend.chart 与 chart 按索引一一对应。",
+    legend: {
+      chart: [
+        "输入参数",
+        "解析后的本地时间",
+        "公历信息",
+        "农历信息",
+        "排盘口径",
+        "四柱",
+        "日主",
+        "五行",
+        "纳音",
+        "天干十神",
+        "地支十神",
+        "四柱详表",
+        "胎元",
+        "胎息",
+        "命宫",
+        "身宫",
+        "起运与大运",
+        "子平与禄命规则审计",
+        "时间边界审计",
+        "小运两法（岁序）",
+      ],
+    },
+    chart: [
+      normalizeValue(chart.input.original),
+      chart.interpretedDateTime,
+      normalizeValue({
+        text: chart.raw.solar,
+        fullText: chart.raw.solarFull,
+      }),
+      normalizeValue({
+        text: chart.raw.lunar,
+        fullText: chart.raw.lunarFull,
+      }),
+      normalizeValue(chart.raw.conventions),
+      normalizeValue(chart.raw.baZi),
+      chart.raw.dayMaster,
+      normalizeValue(chart.raw.wuXing),
+      normalizeValue(chart.raw.naYin),
+      normalizeValue(chart.raw.shiShenGan),
+      normalizeValue(chart.raw.shiShenZhi),
+      normalizeValue(chart.raw.pillars),
+      normalizeValue(chart.raw.taiYuan),
+      normalizeValue(chart.raw.taiXi),
+      normalizeValue(chart.raw.mingGong),
+      normalizeValue(chart.raw.shenGong),
+      normalizeValue(chart.raw.yun),
+      normalizeValue(chart.raw.structureAudit),
+      normalizeValue(chart.raw.boundaryAudit),
+      normalizeValue(chart.raw.xiaoYun ?? []),
+    ],
+    relations,
+  });
+};
+
+export const serializeBaziToStructuredText = (
+  chart: NormalizedBaziChart,
+  options: BaziSerializationOptions = {},
+) => {
+  const relations = buildBaziRelationSummary(chart, options);
+  const { earthlyBranchRelations, heavenlyStemCombinations, timing } = relations;
+  const lines = [
+    "### 总览",
+    `输入时间: ${chart.input.original.datetime}`,
+    `输入时区: ${chart.input.original.timeZone}`,
+    `解析后的本地时间: ${chart.interpretedDateTime}`,
+    `公历: ${chart.raw.solar}`,
+    `农历: ${chart.raw.lunar}`,
+    `排盘口径: ${chart.raw.conventions.yearBoundary === "li-chun" ? "立春换年" : "春节换年"}；${chart.raw.conventions.dayBoundary === "midnight" ? "子正换日" : "子初换日（23时）"}`,
+    `四柱: ${chart.raw.baZi.join(" / ")}`,
+    `日主: ${chart.raw.dayMaster}`,
+    `五行: ${chart.raw.wuXing.join(" / ")}`,
+    `纳音: ${chart.raw.naYin.join(" / ")}`,
+    `天干十神: ${chart.raw.shiShenGan.join(" / ")}`,
+    `地支十神: ${chart.raw.shiShenZhi.join(" / ")}`,
+    `胎元: ${chart.raw.taiYuan.pillar} (${chart.raw.taiYuan.naYin})`,
+    `胎息: ${chart.raw.taiXi.pillar} (${chart.raw.taiXi.naYin})`,
+    `命宫: ${chart.raw.mingGong.pillar} (${chart.raw.mingGong.naYin})`,
+    `身宫: ${chart.raw.shenGong.pillar} (${chart.raw.shenGong.naYin})`,
+    `起运: ${chart.raw.yun.startSolar} / ${chart.raw.yun.direction}`,
+    ...(chart.raw.xiaoYun?.length ? [
+      "小运两法（岁序）：",
+      ...chart.raw.xiaoYun.map(({ age, birthHourMethod, fixedStartMethod }) =>
+        `${age}岁：时柱起 ${birthHourMethod} / 固定起 ${fixedStartMethod}`),
+    ] : []),
+    `规则审计: ${chart.raw.structureAudit.engineVersion}`,
+    `日主强弱候选: ${chart.raw.structureAudit.dayMasterStrength}；从格候选: ${chart.raw.structureAudit.followStructure}；置信度: ${chart.raw.structureAudit.confidence}`,
+    `支持证据: ${chart.raw.structureAudit.supportingEvidence.join("；")}`,
+    `反证与边界: ${chart.raw.structureAudit.contradictingEvidence.join("；")}`,
+    `禄命特征: ${chart.raw.structureAudit.luMingFeatures.map((item) => item.evidence).join("；")}`,
+    `时间边界: ${chart.raw.boundaryAudit.note}`,
+    "",
+    "### 结构关系摘要",
+    `天干五合: ${formatRelationMatches(heavenlyStemCombinations)}`,
+    `天干相冲: ${formatRelationMatches(relations.heavenlyStemClashes)}`,
+    `天干相克: ${formatRelationMatches(relations.heavenlyStemControls)}`,
+    `地支六合: ${formatRelationMatches(earthlyBranchRelations.liuHe)}`,
+    `地支半合: ${formatRelationMatches(earthlyBranchRelations.banHe)}`,
+    `地支拱合（虚位）: ${formatRelationMatches(earthlyBranchRelations.gongHe, true)}`,
+    `地支六冲: ${formatRelationMatches(earthlyBranchRelations.liuChong)}`,
+    `地支三合: ${formatRelationMatches(earthlyBranchRelations.sanHe)}`,
+    `地支三会: ${formatRelationMatches(earthlyBranchRelations.sanHui)}`,
+    `地支刑: ${formatRelationMatches(earthlyBranchRelations.xing)}`,
+    `地支六害: ${formatRelationMatches(earthlyBranchRelations.hai)}`,
+    `地支六破: ${formatRelationMatches(earthlyBranchRelations.po, true)}`,
+    `天克地冲: ${formatRelationMatches(relations.tianKeDiChong, true)}`,
+    `伏吟: ${formatRelationMatches(relations.fuYin)}`,
+    `日柱空亡落宫: ${formatRelationMatches(relations.dayXunKongVoid)}`,
+    `五行未见: ${relations.missingElements.join("、") || "无"}`,
+    `日主旺衰候选: ${relations.dayMasterStrength}`,
+    `关系提示: ${relations.notes.join("；") || "无"}`,
+    "",
+    "### 流年与当前大运",
+    `参考日期: ${timing.referenceDate}`,
+    `流年: ${timing.liuNian.calendarYear} ${timing.liuNian.ganZhi ? `${timing.liuNian.ganZhi}（${timing.liuNian.xun} / ${timing.liuNian.xunKong}）` : `交节前后待定：${timing.liuNian.candidates.map(item => `${item.ganZhi}（${item.xun} / ${item.xunKong}）`).join("、")}`}`,
+    `当前大运: ${timing.currentDaYun?.ganZhi ?? "无法按参考日期确定"}`,
+    timing.currentDaYun
+      ? `当前大运年份: ${timing.currentDaYun.startYear}-${timing.currentDaYun.endYear}，年龄: ${timing.currentDaYun.startAge}-${timing.currentDaYun.endAge}岁`
+      : "当前大运年份: 无",
+    `口径说明: ${timing.note}`,
+  ];
+
+  const pillarBlocks = chart.raw.pillars.map((pillar) =>
+    [
+      `### ${pillar.key === "year" ? "年柱" : pillar.key === "month" ? "月柱" : pillar.key === "day" ? "日柱" : "时柱"}`,
+      `柱: ${pillar.pillar}`,
+      `天干: ${pillar.heavenlyStem}`,
+      `地支: ${pillar.earthlyBranch}`,
+      `藏干: ${pillar.hiddenStems.join(" / ") || "无"}`,
+      `五行: ${pillar.wuXing}`,
+      `纳音: ${pillar.naYin}`,
+      `天干十神: ${pillar.shiShenGan}`,
+      `地支十神: ${pillar.shiShenZhi.join(" / ") || "无"}`,
+      `十二长生: ${pillar.diShi}`,
+      `旬: ${pillar.xun}`,
+      `旬空: ${pillar.xunKong}`,
+      `神煞: ${pillar.shenSha.join(" / ") || "无"}`,
+    ].join("\n"),
+  );
+
+  const yunBlock = [
+    "### 大运",
+    ...chart.raw.yun.daYun.map(
+      (item) =>
+        `${item.index}. ${item.ganZhi} | ${item.startYear}-${item.endYear} | ${item.startAge}-${item.endAge}岁 | ${item.xun} / ${item.xunKong}`,
+    ),
+  ].join("\n");
+
+  return [...lines, ...pillarBlocks, yunBlock].join("\n\n");
+};

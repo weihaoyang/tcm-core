@@ -1,0 +1,193 @@
+import { buildChart } from "./chart";
+import type { QimenSettings } from "./settings";
+import type { NormalizedQimenChart, UserChartInput } from "./types";
+
+export type SequenceStep = "double-hour" | "day" | "month" | "year";
+
+export type ChartSequenceInput = {
+  startDatetime: string;
+  endDatetime: string;
+  timeZone: string;
+  step: SequenceStep;
+};
+
+export type ChartSequenceItem = {
+  index: number;
+  input: UserChartInput;
+  chart: NormalizedQimenChart;
+};
+
+const MAX_SEQUENCE_ITEMS = 120;
+
+const parseDateTimeParts = (datetime: string) => {
+  const match = datetime.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/,
+  );
+
+  if (!match) {
+    throw new Error(`无法解析序列时间: ${datetime}`);
+  }
+
+  const [, year, month, day, hour, minute] = match;
+
+  return {
+    year: Number(year),
+    month: Number(month),
+    day: Number(day),
+    hour: Number(hour),
+    minute: Number(minute),
+  };
+};
+
+const toCalendarDate = (datetime: string) => {
+  const parts = parseDateTimeParts(datetime);
+  const date = new Date(0);
+  date.setUTCFullYear(parts.year, parts.month - 1, parts.day);
+  date.setUTCHours(parts.hour, parts.minute, 0, 0);
+  if (date.getUTCFullYear() !== parts.year || date.getUTCMonth() !== parts.month - 1 ||
+      date.getUTCDate() !== parts.day || date.getUTCHours() !== parts.hour ||
+      date.getUTCMinutes() !== parts.minute) {
+    throw new Error(`无效的序列日期时间: ${datetime}`);
+  }
+  return date;
+};
+
+const toUtcMillis = (datetime: string) => toCalendarDate(datetime).getTime();
+
+const pad = (value: number) => String(value).padStart(2, "0");
+
+const fromUtcMillis = (value: number) => {
+  const date = new Date(value);
+  return [
+    String(date.getUTCFullYear()).padStart(4, "0"),
+    "-",
+    pad(date.getUTCMonth() + 1),
+    "-",
+    pad(date.getUTCDate()),
+    "T",
+    pad(date.getUTCHours()),
+    ":",
+    pad(date.getUTCMinutes()),
+  ].join("");
+};
+
+export const buildSequenceInputs = (
+  input: ChartSequenceInput,
+  qimenSettings?: QimenSettings,
+): UserChartInput[] => {
+  if (!input.startDatetime || !input.endDatetime) {
+    throw new Error("请输入序列起止日期时间。");
+  }
+
+  if (!input.timeZone) {
+    throw new Error("请输入序列时区。");
+  }
+
+  const start = toUtcMillis(input.startDatetime);
+  const end = toUtcMillis(input.endDatetime);
+
+  if (end < start) {
+    throw new Error("序列结束时间不能早于开始时间。");
+  }
+
+  const stepMs = input.step === "day" ? 24 * 60 * 60 * 1000 : 2 * 60 * 60 * 1000;
+  const result: UserChartInput[] = [];
+
+  if (input.step === "month" || input.step === "year") {
+    let index = 0;
+    while (true) {
+      const currentDatetime = addCalendarStep(input.startDatetime, input.step, index);
+      const current = toUtcMillis(currentDatetime);
+      if (current > end) break;
+      if (result.length >= MAX_SEQUENCE_ITEMS) throw new Error(`序列最多生成 ${MAX_SEQUENCE_ITEMS} 个盘，请缩短时间范围。`);
+      result.push({ datetime: currentDatetime, timeZone: input.timeZone, qimenSettings });
+      index += 1;
+    }
+    return result;
+  }
+
+  for (let current = start; current <= end; current += stepMs) {
+    if (result.length >= MAX_SEQUENCE_ITEMS) {
+      throw new Error(`序列最多生成 ${MAX_SEQUENCE_ITEMS} 个盘，请缩短时间范围。`);
+    }
+
+    result.push({
+      datetime: fromUtcMillis(current),
+      timeZone: input.timeZone,
+      qimenSettings,
+    });
+  }
+
+  return result;
+};
+
+export const buildChartSequence = (
+  input: ChartSequenceInput,
+  qimenSettings?: QimenSettings,
+): ChartSequenceItem[] =>
+  buildSequenceInputs(input, qimenSettings).map((nextInput, index) => ({
+    index,
+    input: nextInput,
+    chart: buildChart(nextInput),
+  }));
+
+const lastDayOfMonth = (year: number, monthIndex: number) => {
+  const date = new Date(0);
+  date.setUTCFullYear(year, monthIndex + 1, 0);
+  return date.getUTCDate();
+};
+
+/**
+ * Step by whole months without letting the day overflow into the next month.
+ *
+ * `setUTCMonth` rolls out-of-range days forward, so a monthly sequence started
+ * on the 31st silently skips months: 2026-01-31 +1 month becomes 2026-03-03,
+ * and February never appears. Clamp to the last valid day of the target month
+ * instead.
+ */
+const addMonthsClamped = (date: Date, months: number) => {
+  const day = date.getUTCDate();
+  const target = new Date(date);
+  target.setUTCMonth(date.getUTCMonth() + months, 1);
+  target.setUTCDate(Math.min(day, lastDayOfMonth(target.getUTCFullYear(), target.getUTCMonth())));
+  return target;
+};
+
+/** Same overflow problem as `addMonthsClamped`, for 02-29 stepping a year. */
+const addYearsClamped = (date: Date, years: number) => {
+  const day = date.getUTCDate();
+  const target = new Date(date);
+  target.setUTCFullYear(date.getUTCFullYear() + years, date.getUTCMonth(), 1);
+  target.setUTCDate(Math.min(day, lastDayOfMonth(target.getUTCFullYear(), target.getUTCMonth())));
+  return target;
+};
+
+function addCalendarStep(datetime: string, step: SequenceStep, count: number) {
+  const date = toCalendarDate(datetime);
+  if (step === "double-hour") {
+    date.setUTCHours(date.getUTCHours() + count * 2);
+    return fromUtcMillis(date.getTime());
+  }
+  if (step === "day") {
+    date.setUTCDate(date.getUTCDate() + count);
+    return fromUtcMillis(date.getTime());
+  }
+  if (step === "month") return fromUtcMillis(addMonthsClamped(date, count).getTime());
+  return fromUtcMillis(addYearsClamped(date, count).getTime());
+}
+
+export const buildChartSequenceByCount = (
+  startDatetime: string,
+  timeZone: string,
+  step: SequenceStep,
+  count = 20,
+  qimenSettings?: QimenSettings,
+): ChartSequenceItem[] => {
+  if (count < 2 || count > MAX_SEQUENCE_ITEMS) throw new Error("序列点数必须在 2 到 120 之间。");
+  parseDateTimeParts(startDatetime);
+  return Array.from({ length: count }, (_, index) => {
+    const datetime = addCalendarStep(startDatetime, step, index);
+    const input = { datetime, timeZone, qimenSettings };
+    return { index, input, chart: buildChart(input) };
+  });
+};
